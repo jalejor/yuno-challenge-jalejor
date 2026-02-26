@@ -34,8 +34,8 @@ SECRET_PATH="secret/flexpay/processors"
 if command -v vault > /dev/null 2>&1; then
   VAULT_CMD="vault"
 elif command -v docker > /dev/null 2>&1 && docker inspect "${VAULT_CONTAINER}" > /dev/null 2>&1; then
-  log() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] [rotation] $*"; }
-  log "Local 'vault' CLI not found — using docker exec ${VAULT_CONTAINER}"
+  # log() is defined below; use echo here since log() isn't available yet
+  echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] [rotation] Local 'vault' CLI not found — using docker exec ${VAULT_CONTAINER}"
   VAULT_CMD="docker exec -e VAULT_ADDR=${VAULT_ADDR} -e VAULT_TOKEN=${VAULT_TOKEN} ${VAULT_CONTAINER} vault"
 else
   echo "ERROR: Neither 'vault' CLI nor Docker container '${VAULT_CONTAINER}' is available." >&2
@@ -103,11 +103,11 @@ validate_field_name() {
 }
 
 get_current_version() {
+  # Use -field flag to extract current_version directly — no python3 dependency
   ${VAULT_CMD} kv metadata get \
     -address="${VAULT_ADDR}" \
-    -format=json \
-    "${SECRET_PATH}" | \
-    python3 -c "import sys, json; m=json.load(sys.stdin); print(m['data']['current_version'])" 2>/dev/null || echo "unknown"
+    -field=current_version \
+    "${SECRET_PATH}" 2>/dev/null || echo "unknown"
 }
 
 rotate_secret() {
@@ -129,30 +129,28 @@ rotate_secret() {
 
   # Read all current values so we can patch just the target field
   # This is required for KV v2 — writes replace the entire secret
+  # Using vault kv get -field=<name> avoids a python3 / jq dependency
   log "Reading current processor credentials for patch update..."
-  CURRENT_DATA=$(${VAULT_CMD} kv get \
-    -address="${VAULT_ADDR}" \
-    -format=json \
-    "${SECRET_PATH}" 2>/dev/null)
 
-  if [ -z "${CURRENT_DATA}" ]; then
+  # Verify connectivity by reading one field; exit early if Vault is unreachable
+  if ! ${VAULT_CMD} kv get -address="${VAULT_ADDR}" -field=PROCESSOR_A_API_KEY "${SECRET_PATH}" > /dev/null 2>&1; then
     log_error "Could not read current secrets from Vault. Is Vault running?"
     exit 1
   fi
 
-  # Extract all current field values (we'll update only the target field)
-  PROCESSOR_A_API_KEY=$(echo "${CURRENT_DATA}" | python3 -c "import sys,json; d=json.load(sys.stdin)['data']['data']; print(d.get('PROCESSOR_A_API_KEY',''))")
-  PROCESSOR_A_SECRET=$(echo "${CURRENT_DATA}" | python3 -c "import sys,json; d=json.load(sys.stdin)['data']['data']; print(d.get('PROCESSOR_A_SECRET',''))")
-  PROCESSOR_B_MERCHANT_ID=$(echo "${CURRENT_DATA}" | python3 -c "import sys,json; d=json.load(sys.stdin)['data']['data']; print(d.get('PROCESSOR_B_MERCHANT_ID',''))")
-  PROCESSOR_B_API_KEY=$(echo "${CURRENT_DATA}" | python3 -c "import sys,json; d=json.load(sys.stdin)['data']['data']; print(d.get('PROCESSOR_B_API_KEY',''))")
-  PROCESSOR_C_ENDPOINT=$(echo "${CURRENT_DATA}" | python3 -c "import sys,json; d=json.load(sys.stdin)['data']['data']; print(d.get('PROCESSOR_C_ENDPOINT',''))")
-  PROCESSOR_C_TOKEN=$(echo "${CURRENT_DATA}" | python3 -c "import sys,json; d=json.load(sys.stdin)['data']['data']; print(d.get('PROCESSOR_C_TOKEN',''))")
+  # Extract each field individually — vault kv get -field returns the raw value
+  PROCESSOR_A_API_KEY=$(${VAULT_CMD} kv get -address="${VAULT_ADDR}" -field=PROCESSOR_A_API_KEY "${SECRET_PATH}" 2>/dev/null || echo "")
+  PROCESSOR_A_SECRET=$(${VAULT_CMD} kv get -address="${VAULT_ADDR}" -field=PROCESSOR_A_SECRET "${SECRET_PATH}" 2>/dev/null || echo "")
+  PROCESSOR_B_MERCHANT_ID=$(${VAULT_CMD} kv get -address="${VAULT_ADDR}" -field=PROCESSOR_B_MERCHANT_ID "${SECRET_PATH}" 2>/dev/null || echo "")
+  PROCESSOR_B_API_KEY=$(${VAULT_CMD} kv get -address="${VAULT_ADDR}" -field=PROCESSOR_B_API_KEY "${SECRET_PATH}" 2>/dev/null || echo "")
+  PROCESSOR_C_ENDPOINT=$(${VAULT_CMD} kv get -address="${VAULT_ADDR}" -field=PROCESSOR_C_ENDPOINT "${SECRET_PATH}" 2>/dev/null || echo "")
+  PROCESSOR_C_TOKEN=$(${VAULT_CMD} kv get -address="${VAULT_ADDR}" -field=PROCESSOR_C_TOKEN "${SECRET_PATH}" 2>/dev/null || echo "")
 
   # Update the target field with the new value
   eval "${FIELD_NAME}=\"${NEW_VALUE}\""
 
   log "Writing updated credentials to Vault (patch operation)..."
-  vault kv put \
+  ${VAULT_CMD} kv put \
     -address="${VAULT_ADDR}" \
     "${SECRET_PATH}" \
     PROCESSOR_A_API_KEY="${PROCESSOR_A_API_KEY}" \
