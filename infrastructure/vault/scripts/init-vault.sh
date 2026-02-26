@@ -151,9 +151,13 @@ write_auth_credentials() {
   printf '%s' "${ROLE_ID}" > "${CREDENTIALS_DIR}/role_id"
   printf '%s' "${SECRET_ID}" > "${CREDENTIALS_DIR}/secret_id"
 
-  # Restrict file permissions — readable only by owner
-  chmod 600 "${CREDENTIALS_DIR}/role_id"
-  chmod 600 "${CREDENTIALS_DIR}/secret_id"
+  # Set file permissions to world-readable (644) so the non-root appuser (uid 1001)
+  # in the payment-service container can read them from the shared Docker volume.
+  # chmod 600 would restrict access to root only, breaking the multi-container setup.
+  # In production, use a secrets manager that handles injection directly (e.g., Vault
+  # Agent sidecar) to avoid cross-container file ownership issues entirely.
+  chmod 644 "${CREDENTIALS_DIR}/role_id"
+  chmod 644 "${CREDENTIALS_DIR}/secret_id"
 
   log "AppRole credentials written to ${CREDENTIALS_DIR}/"
   log "  role_id:   ${CREDENTIALS_DIR}/role_id   (static role identifier)"
@@ -170,7 +174,7 @@ verify_setup() {
     -address="${VAULT_ADDR}" \
     -format=json \
     secret/flexpay/processors | \
-    python3 -c "import sys, json; d=json.load(sys.stdin); print(len(d['data']['data']))" 2>/dev/null || echo "0")
+    grep -o '"PROCESSOR_' | wc -l | tr -d ' ' 2>/dev/null || echo "0")
 
   if [ "${SECRET_COUNT}" -ge 6 ]; then
     log "PASS: ${SECRET_COUNT} credentials found in Vault at secret/flexpay/processors"

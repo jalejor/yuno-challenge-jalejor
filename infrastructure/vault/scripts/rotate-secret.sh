@@ -26,7 +26,22 @@ set -e
 
 VAULT_ADDR="${VAULT_ADDR:-http://localhost:8200}"
 VAULT_TOKEN="${VAULT_TOKEN:-root}"
+VAULT_CONTAINER="${VAULT_CONTAINER:-flexpay-vault}"
 SECRET_PATH="secret/flexpay/processors"
+
+# Determine how to run vault CLI: prefer local binary, fall back to docker exec.
+# This allows the script to work without a local Vault installation.
+if command -v vault > /dev/null 2>&1; then
+  VAULT_CMD="vault"
+elif command -v docker > /dev/null 2>&1 && docker inspect "${VAULT_CONTAINER}" > /dev/null 2>&1; then
+  log() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] [rotation] $*"; }
+  log "Local 'vault' CLI not found — using docker exec ${VAULT_CONTAINER}"
+  VAULT_CMD="docker exec -e VAULT_ADDR=${VAULT_ADDR} -e VAULT_TOKEN=${VAULT_TOKEN} ${VAULT_CONTAINER} vault"
+else
+  echo "ERROR: Neither 'vault' CLI nor Docker container '${VAULT_CONTAINER}' is available." >&2
+  echo "Install the Vault CLI or ensure the flexpay-vault container is running." >&2
+  exit 1
+fi
 
 # Color codes for output
 RED='\033[0;31m'
@@ -88,7 +103,7 @@ validate_field_name() {
 }
 
 get_current_version() {
-  vault kv metadata get \
+  ${VAULT_CMD} kv metadata get \
     -address="${VAULT_ADDR}" \
     -format=json \
     "${SECRET_PATH}" | \
@@ -115,7 +130,7 @@ rotate_secret() {
   # Read all current values so we can patch just the target field
   # This is required for KV v2 — writes replace the entire secret
   log "Reading current processor credentials for patch update..."
-  CURRENT_DATA=$(vault kv get \
+  CURRENT_DATA=$(${VAULT_CMD} kv get \
     -address="${VAULT_ADDR}" \
     -format=json \
     "${SECRET_PATH}" 2>/dev/null)

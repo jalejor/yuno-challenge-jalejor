@@ -52,11 +52,13 @@ services:
     volumes:
       - vault-data:/vault/data
       - vault-logs:/vault/logs
-      - ./vault/config.hcl:/vault/config/config.hcl:ro
+      # NOTE: config.hcl is NOT mounted in dev mode — `server -dev` starts Vault
+      # with its own built-in listener on port 8200. Mounting config.hcl would
+      # define a second listener on the same port, causing a bind error.
+      # Production deployment would use: vault server -config=/vault/config/config.hcl
+      # with a proper unseal process (KMS auto-unseal or manual unseal ceremony).
     command: server -dev
-    # NOTE: Using dev mode for PoC simplicity.
-    # Production deployment would use: vault server -config=/vault/config/config.hcl
-    # with a proper unseal process (KMS auto-unseal or manual unseal ceremony).
+    # NOTE: Using dev mode for PoC simplicity (auto-unseal, in-memory storage).
     healthcheck:
       test: ["CMD", "vault", "status"]
       interval: 5s
@@ -86,7 +88,7 @@ services:
       VAULT_TOKEN: "root"
     volumes:
       - ./vault/scripts/init-vault.sh:/init-vault.sh:ro
-      - ./vault/policies/payment-service.hcl:/payment-service.hcl:ro
+      - ./vault/policies/payment-service.hcl:/vault/policies/payment-service.hcl:ro
       - vault-credentials:/vault/credentials
     command: sh /init-vault.sh
     depends_on:
@@ -122,6 +124,11 @@ services:
       # Mount credentials volume read-only; service reads role_id and secret_id files
       - vault-credentials:/vault/credentials:ro
     ports:
+      # Port range 3000-3002 maps to container port 3000 for up to 3 replicas.
+      # With --scale payment-service=3, Docker assigns:
+      #   replica 1 → host port 3000, replica 2 → host port 3001, replica 3 → host port 3002
+      # In production, traffic would go through an upstream load balancer (nginx/ALB),
+      # not directly to replica ports. This range is sufficient for local PoC validation.
       - "3000-3002:3000"
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
@@ -132,8 +139,11 @@ services:
     depends_on:
       vault-init:
         condition: service_completed_successfully
-    # deploy block is honoured in Docker Swarm mode.
-    # For plain docker compose, use deploy.sh for rolling updates (see below).
+    # NOTE: The 'deploy' block below is IGNORED in plain `docker compose` (non-Swarm) mode.
+    # It is documented here for reference and for future Swarm/ECS deployment.
+    # For local zero-downtime rolling updates, use deploy.sh which calls:
+    #   docker compose up --scale payment-service=3 --no-recreate -d
+    # followed by sequential container replacements with health-check gating.
     deploy:
       replicas: 3
       update_config:

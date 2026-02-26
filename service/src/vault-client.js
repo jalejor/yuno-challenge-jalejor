@@ -1,5 +1,6 @@
 'use strict';
 
+const fs = require('fs');
 const vault = require('node-vault');
 const pino = require('pino');
 const auditLogger = require('./audit-logger');
@@ -14,9 +15,30 @@ let _cachedSecrets = null;
 let _refreshTimer = null;
 let _lastKvVersion = null; // Track KV version for rotation detection
 
+/**
+ * Read a credential value from a file path (preferred) or direct env var (fallback).
+ * File-based reading is more secure — avoids credential exposure in `docker inspect`
+ * output, /proc/self/environ, and process listings.
+ *
+ * @param {string} envVar      - Direct env var name (e.g. VAULT_ROLE_ID)
+ * @param {string} fileEnvVar  - Env var containing a file path (e.g. VAULT_ROLE_ID_FILE)
+ * @returns {string|null}
+ */
+function readCredential(envVar, fileEnvVar) {
+  const filePath = process.env[fileEnvVar];
+  if (filePath) {
+    try {
+      return fs.readFileSync(filePath, 'utf8').trim();
+    } catch (err) {
+      logger.warn({ fileEnvVar, filePath, err: err.message }, 'Could not read credential file, falling back to env var');
+    }
+  }
+  return process.env[envVar] || null;
+}
+
 const VAULT_ADDR = process.env.VAULT_ADDR || 'http://vault:8200';
-const VAULT_ROLE_ID = process.env.VAULT_ROLE_ID;
-const VAULT_SECRET_ID = process.env.VAULT_SECRET_ID;
+const VAULT_ROLE_ID = readCredential('VAULT_ROLE_ID', 'VAULT_ROLE_ID_FILE');
+const VAULT_SECRET_ID = readCredential('VAULT_SECRET_ID', 'VAULT_SECRET_ID_FILE');
 const SECRETS_PATH = 'secret/data/flexpay/processors';
 const REFRESH_INTERVAL_MS = 60_000; // 60 seconds
 
@@ -47,8 +69,9 @@ async function withRetry(fn, { maxAttempts = 5, baseDelayMs = 1000, label = 'ope
  * Initialise the Vault client and authenticate via AppRole.
  * Sets the internal client token so subsequent requests are authenticated.
  *
- * Reads VAULT_ROLE_ID and VAULT_SECRET_ID from environment (these are
- * AppRole authentication identifiers, NOT payment processor credentials).
+ * Reads VAULT_ROLE_ID and VAULT_SECRET_ID from files (via VAULT_ROLE_ID_FILE /
+ * VAULT_SECRET_ID_FILE env vars) or directly from env vars as a fallback.
+ * These are AppRole authentication identifiers — NOT payment processor credentials.
  */
 async function initVaultClient() {
   if (!VAULT_ROLE_ID || !VAULT_SECRET_ID) {

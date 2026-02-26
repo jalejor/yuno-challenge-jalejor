@@ -30,7 +30,7 @@ A PCI-DSS compliant secrets management proof-of-concept for FlexPay's payment ga
 │  ┌──────────────────────────────────────────────────────────┐  │
 │  │              payment-service (3 replicas)                │  │
 │  │                                                          │  │
-│  │  replica-1 :3001   replica-2 :3002   replica-3 :3003    │  │
+│  │  replica-1 :3000   replica-2 :3001   replica-3 :3002    │  │
 │  │  ┌──────────────────────────────────────────────────┐   │  │
 │  │  │  On startup: authenticate → fetch credentials    │   │  │
 │  │  │  /health → 503 until secrets loaded              │   │  │
@@ -63,19 +63,49 @@ brew install trivy
 brew install gitleaks
 ```
 
+### Prerequisites Verification
+
+Run these commands to confirm your environment is ready before starting:
+
+```bash
+# Check Docker version (must be 20.10+)
+docker --version
+# Expected: Docker version 20.10.x or higher
+
+# Check Docker Compose v2 (must be 2.0+)
+docker compose version
+# Expected: Docker Compose version v2.x.x
+
+# Verify Docker daemon is running
+docker info --format '{{.ServerVersion}}'
+# Expected: prints a version string (errors mean daemon is not running)
+
+# Check Git
+git --version
+# Expected: git version 2.x.x
+
+# Optional: Check Trivy (for local CVE scanning)
+trivy --version 2>/dev/null || echo "trivy not installed (optional)"
+
+# Optional: Check gitleaks (for local secret scanning)
+gitleaks version 2>/dev/null || echo "gitleaks not installed (optional)"
+```
+
 ## Quick Start
+
+> **First-run note**: Docker will pull the `hashicorp/vault` image (~200 MB) and build the `payment-service` image on first run. Allow 2–5 minutes depending on your connection. Subsequent starts are fast (images are cached).
 
 ```bash
 # 1. Clone the repo
 git clone <repo> && cd flexpay-secrets-poc
 
 # 2. Start the full stack (Vault + Payment Service — 3 replicas)
-cd infrastructure && docker compose up -d
+cd infrastructure && docker compose up --scale payment-service=3 -d
 
-# 3. Wait for all services to become healthy (~30 seconds)
-docker compose ps  # All services should show "healthy"
+# 3. Wait for all services to become healthy (~30–60 seconds on first run)
+docker compose ps  # All services should show "healthy" or "exited (0)" for vault-init
 
-# 4. Test the health endpoint (returns 503 until secrets are loaded)
+# 4. Test the health endpoint on replica 1 (port 3000)
 curl http://localhost:3000/health
 
 # Expected response:
@@ -85,9 +115,14 @@ curl http://localhost:3000/health
 curl -X POST http://localhost:3000/pay \
   -H "Content-Type: application/json" \
   -d '{"processor": "A", "amount": 100}'
+
+# 6. When done, stop and remove all containers and volumes
+cd infrastructure && docker compose down -v
+# The -v flag removes named volumes (clears Vault data and AppRole credentials)
+# This ensures a clean state for the next run
 ```
 
-> **Note**: The service returns HTTP 503 on `/health` until it has successfully authenticated to Vault and retrieved all credentials. This gates traffic during rolling deployments.
+> **Note**: The service returns HTTP 503 on `/health` until it has successfully authenticated to Vault and retrieved all credentials. This gates traffic during rolling deployments. With `--scale payment-service=3`, replicas are accessible on host ports **3000** (replica 1), **3001** (replica 2), and **3002** (replica 3).
 
 ## Validation Commands (Auditor Checklist)
 
@@ -107,7 +142,7 @@ curl -X POST http://localhost:3000/pay \
 ### 2. Verify NO secrets in service logs
 
 ```bash
-# Check running service logs for any credential leakage
+# Run from repository root — or omit -f flag if already in infrastructure/
 docker compose -f infrastructure/docker-compose.yml logs payment-service \
   | grep -iE "api_key|secret|token|password|credential"
 
@@ -185,8 +220,17 @@ curl -H "X-Vault-Token: <payment-service-token>" \
 ## Stopping the Stack
 
 ```bash
+# Stop all containers and remove named volumes (full cleanup)
 cd infrastructure && docker compose down -v
-# -v removes volumes (clears Vault data and AppRole credentials)
+
+# The -v flag is important: it removes the vault-credentials volume that holds
+# the AppRole role_id and secret_id. Without -v, stale credentials from the
+# previous run persist, which can cause authentication failures on restart.
+
+# To stop without removing data (e.g., to pause and resume):
+docker compose stop
+# Then resume with:
+docker compose start
 ```
 
 ## File Structure
@@ -299,9 +343,13 @@ docker compose -f infrastructure/docker-compose.yml logs vault-init
 
 **Port 3000 already in use**
 ```bash
-# The compose file maps replicas to 3001, 3002, 3003 individually
-# An nginx or traefik load balancer can front them on 3000
-# Or: change PORT in docker-compose.yml
+# The compose file maps replicas to host ports 3000, 3001, 3002 (container port 3000).
+# If any of these ports are taken, you'll see a "bind: address already in use" error.
+# Find and stop the conflicting process:
+lsof -i :3000    # macOS/Linux: shows which process is using port 3000
+# Or update the port range in docker-compose.yml:
+#   ports: - "4000-4002:3000"
+# then access the service on http://localhost:4000/health
 ```
 
 **gitleaks not found for local scan**
