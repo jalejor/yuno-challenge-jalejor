@@ -64,6 +64,7 @@ jobs:
     needs: secret-scan
     outputs:
       image-tag: ${{ steps.meta.outputs.image-tag }}
+      short-sha: ${{ steps.meta.outputs.short-sha }}
 
     steps:
       - name: Checkout repository
@@ -228,8 +229,7 @@ jobs:
       - name: Download verified image artifact
         uses: actions/download-artifact@v4
         with:
-          name: docker-image-${{ needs.build.outputs.image-tag && '' || github.sha && '' }}
-          # Note: artifact name uses short SHA; rebuild from meta in real deployment
+          name: docker-image-${{ needs.build.outputs.short-sha }}
           # In production, images would be pushed to a container registry (ECR, GCR, etc.)
           # and pulled by tag — no artifact passing needed.
 

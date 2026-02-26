@@ -181,8 +181,8 @@ watch -n1 'curl -s http://localhost:3000/health | jq .'
 ./infrastructure/vault/scripts/rotate-secret.sh PROCESSOR_A_API_KEY "new_rotated_key_123"
 
 # The service picks up the new secret on its next refresh cycle (60s)
-# or trigger immediate check:
-curl http://localhost:3000/health
+# or trigger an immediate refresh:
+curl -X POST http://localhost:3000/admin/refresh-secrets
 
 # Expected: Service remains healthy, continues processing payments
 # with the new credential — no restart required
@@ -228,9 +228,9 @@ cd infrastructure && docker compose down -v
 # previous run persist, which can cause authentication failures on restart.
 
 # To stop without removing data (e.g., to pause and resume):
-docker compose stop
+docker compose -f infrastructure/docker-compose.yml stop
 # Then resume with:
-docker compose start
+docker compose -f infrastructure/docker-compose.yml start
 ```
 
 ## File Structure
