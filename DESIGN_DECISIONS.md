@@ -4,29 +4,21 @@
 
 ### Why HashiCorp Vault
 
-After evaluating several secrets management solutions, HashiCorp Vault was selected as the primary secrets store for the following reasons:
+HashiCorp Vault was selected after evaluating three alternatives:
 
-**vs. AWS Secrets Manager**: AWS Secrets Manager is an excellent production choice but requires an AWS account, imposes costs, and cannot be run locally. Vault runs in Docker with zero external dependencies, making this PoC reproducible by any evaluator in minutes. In production, the same Vault API and AppRole auth pattern translates directly to a cloud-hosted Vault cluster without code changes.
+**vs. AWS Secrets Manager**: Excellent production choice, but requires an AWS account and cannot run locally. Vault runs in Docker with zero dependencies, making this PoC reproducible by any evaluator in minutes. The same AppRole auth pattern translates directly to cloud-hosted Vault without code changes.
 
-**vs. SOPS (Secrets OPerationS)**: SOPS encrypts secrets at rest in version control, which is useful for GitOps workflows. However, SOPS does not provide a runtime API — secrets must be decrypted before use, which means they exist as plaintext on disk or in environment variables. Vault provides a runtime HTTP API that allows the service to fetch secrets on demand, never touching disk outside of Vault's encrypted storage.
+**vs. SOPS**: Encrypts secrets at rest in version control but provides no runtime API — secrets exist as plaintext on disk or in environment variables after decryption. Vault's HTTP API allows on-demand secret retrieval without disk exposure.
 
-**vs. Kubernetes Secrets**: Kubernetes Secrets are base64-encoded, not encrypted at rest by default, and require additional configuration (KMS envelope encryption, etcd encryption) to meet PCI-DSS requirements. Vault provides encryption at rest out of the box, fine-grained access policies, and a full audit log — all required for PCI-DSS compliance.
+**vs. Kubernetes Secrets**: Base64-encoded, not encrypted at rest by default. Requires additional KMS/etcd encryption for PCI-DSS compliance. Vault provides encryption at rest, fine-grained policies, and audit logging out of the box.
 
 ### Why AppRole Authentication
 
-AppRole was chosen over static token auth for service-to-Vault authentication:
-
-- **Machine-friendly**: AppRole is designed for automated systems. It uses a two-part credential (RoleID + SecretID) where RoleID is semi-public (like a username) and SecretID is secret (like a password). Neither alone is sufficient to authenticate.
-- **Least privilege**: Each AppRole is bound to a specific Vault policy. The `payment-service` role can only read from `secret/data/flexpay/processors` — nothing else.
-- **Token renewal**: Vault issues short-lived tokens after AppRole login that can be renewed, limiting the blast radius if a token is compromised.
-- **No static root tokens**: In production, root tokens are immediately revoked after initial setup. Services never hold elevated credentials.
+AppRole was chosen over static token auth because it is machine-friendly (two-part credential: RoleID + SecretID), supports least-privilege policies (our role can only read `secret/data/flexpay/processors`), issues short-lived renewable tokens (limiting compromise blast radius), and eliminates static root tokens from production.
 
 ### Why KV v2 (Versioned Secrets)
 
-The KV v2 secrets engine maintains a version history for every secret. This is critical for:
-
-- **Safe rotation**: When a new credential is written, the previous version remains accessible and retrievable. If a newly rotated credential is invalid, a single `vault kv rollback` command restores the previous value.
-- **Audit trail**: Vault's audit log records which version was read, by whom, and when — meeting PCI-DSS requirement 10 (track and monitor access to network resources and cardholder data).
+KV v2 maintains version history for every secret, enabling safe rotation (previous version remains retrievable; `vault kv rollback` restores instantly) and audit compliance (PCI-DSS Req 10: which version was read, by whom, and when).
 
 ---
 
@@ -62,90 +54,41 @@ The PoC intentionally accepts these trade-offs to remain runnable in a single `d
 
 ## 4. Credential Rotation Workflow
 
-Zero-downtime rotation is achievable because secrets are fetched at runtime, not baked into images or containers:
+Zero-downtime rotation works because secrets are fetched at runtime, not baked into images:
 
-1. **Trigger**: Security team runs `rotate-secret.sh PROCESSOR_A_API_KEY "new_key_value"`, or an automated CronJob fires on a schedule (e.g., every 90 days per PCI-DSS requirement 8.3.9).
-2. **New credential provisioned**: The script (or automation) calls the payment processor's API to generate a new credential. Both old and new credentials are valid simultaneously during the transition window.
-3. **Write to Vault**: The script runs `vault kv patch secret/flexpay/processors PROCESSOR_A_API_KEY="new_key_value"`. Vault creates version N+1, preserving version N. The old credential remains retrievable via `vault kv get -version=N`.
-4. **Running containers detect the change**: Each service instance polls Vault for fresh secrets every 60 seconds (configurable). On the next poll, `getSecrets()` fetches the new version. The Vault KV metadata endpoint allows version comparison — the service only reloads if the version number has advanced.
-5. **In-memory update without restart**: The service atomically swaps its in-memory credential cache. No restart required, no downtime, no traffic interruption.
-6. **Validation**: A health check call confirms the service is operational with the new credentials. A test transaction to the processor validates the new key works end-to-end.
-7. **Old credential revoked**: After a grace period (configurable, e.g., 5 minutes), the old credential is revoked at the processor level. Vault's KV version history preserves the old value for audit purposes but it is no longer functionally valid.
-8. **Audit record**: Vault's audit log records the `kv/patch` write operation with the actor identity, timestamp, and path — providing the immutable record required by PCI-DSS Requirement 10.
+1. **Trigger**: Security team runs `rotate-secret.sh PROCESSOR_A_API_KEY "new_key_value"` (or automated CronJob per PCI-DSS 8.3.9 — every 90 days).
+2. **Provision**: Generate new credential at payment processor API. Both old and new are valid during transition.
+3. **Write to Vault**: `vault kv patch secret/flexpay/processors PROCESSOR_A_API_KEY="new_value"` → creates version N+1, preserving N.
+4. **Container detection**: Service polls Vault every 60s, compares KV version metadata, reloads only when version advances.
+5. **In-memory swap**: Service atomically updates credential cache. No restart, no downtime.
+6. **Validation**: Health check + test transaction confirm new credential works.
+7. **Revoke old**: After grace period (~5 min), old credential revoked at processor level. Vault retains version for audit.
+8. **Audit**: Vault logs the `kv/patch` with actor identity, timestamp, path (PCI-DSS Req 10).
 
-If at any step the new credential is found to be invalid, `vault kv rollback -version=N secret/flexpay/processors` restores the previous value. Running instances pick it up on the next poll cycle.
+Rollback: `vault kv rollback -version=N secret/flexpay/processors` restores previous value instantly.
 
 ---
 
 ## 5. Failure Scenario Handling
 
-**Vault unavailable at startup**: The service retries Vault authentication with exponential backoff (1s, 2s, 4s, 8s... up to 30s max). During retries, `/health` returns HTTP 503 with `{ "status": "unhealthy", "secretsLoaded": false }`. The orchestrator's health check gate prevents any traffic from being routed to this instance. After exhausting retries, the container exits with a non-zero code, triggering an alert and allowing the orchestrator to reschedule.
+**Vault unavailable at startup**: Service retries with exponential backoff (5 attempts, 2s base). `/health` returns 503 until secrets load — orchestrator never routes traffic to unready instances. After exhausting retries, container exits non-zero for rescheduling.
 
-**Vault unavailable during operation**: Once secrets are loaded into memory, the service continues processing payments using its cached credentials. It logs a warning (not the credential values) and increments a metric that alerts the operations team. The cache is valid until the next successful Vault poll. This provides resilience for transient network issues while still surfacing the problem.
+**Vault unavailable during operation**: Service continues on cached credentials, logs warnings (never values), alerts ops team. Cache remains valid until next successful Vault poll — resilient to transient network issues.
 
-**Expired or invalid credential**: The payment processor returns an authentication error. The service logs the error with the processor name and error code (never the credential value), increments an error counter, and raises an alert. The on-call engineer runs the rotation script to provision a fresh credential. Because rotation is fast (< 5 seconds for Vault write, < 60 seconds for containers to pick up), the mean time to recovery is under two minutes.
+**Expired/invalid credential**: Processor returns auth error → service logs error code (not value), raises alert. Engineer runs rotation script; MTTR < 2 minutes (5s Vault write + 60s container pickup).
 
-**Bad rotation (new credential is invalid)**: KV v2 versioning enables instant rollback. Running containers still hold the previous valid credential in cache and continue operating normally. The engineer runs `vault kv rollback` to restore the previous Vault version. Containers will pick up the restored value on the next poll cycle. The net result is zero user-visible impact.
+**Bad rotation**: KV v2 enables instant rollback (`vault kv rollback`). Running containers still hold previous valid credentials in cache. Zero user-visible impact.
 
-**Network partition between service and Vault**: The service operates in degraded mode using its in-memory credential cache. It cannot load rotated credentials until connectivity is restored, but existing credentials remain valid. Once connectivity resumes, the next Vault poll succeeds and the cache is refreshed. This is acceptable for PCI-DSS as long as the credentials themselves remain confidential — which they do, since they never leave the service process.
+**Network partition**: Service operates in degraded mode on cached secrets. Cannot pick up rotated credentials until connectivity restores, but existing credentials remain valid and confidential (never leave process memory).
 
 ---
 
-## 6. Multi-Environment Isolation
+## 6. Multi-Environment Secrets Isolation
 
-A production payment platform requires strict isolation between development, staging, and production secrets. Mixing environments is a common source of PCI-DSS audit failures (e.g., a developer using a real cardholder credential in a test environment). There are two primary patterns with Vault:
+Production requires strict isolation between dev/staging/prod secrets — mixing is a common PCI-DSS audit failure. Two patterns apply:
 
-### Pattern A — Vault Namespaces (Recommended for Enterprise)
+**Vault Enterprise (Namespaces)**: Each environment gets an isolated namespace (`dev/`, `staging/`, `prod/`) sharing one HA cluster but with independent secret engines, policies, and audit logs. A dev-scoped token cannot read any `prod/` path. Policies tighten per environment — dev allows `secret/data/flexpay/*` (wildcard), prod allows only `secret/data/flexpay/processors` (single path, read-only).
 
-Vault Enterprise supports **namespaces**: isolated, fully-separated tenants within a single Vault cluster. Each namespace has its own secret engines, auth methods, policies, and audit log — but shares the underlying storage and HA cluster. This means:
+**Vault OSS (Separate Instances)**: One Vault cluster per environment, each independently sealed and network-isolated. `VAULT_ADDR` in service config points to the correct cluster; AppRole SecretIDs are cluster-scoped (dev credentials are invalid against prod Vault).
 
-```
-vault-cluster.internal/
-  namespaces/
-    dev/      ← development team Vault namespace
-    staging/  ← QA/staging namespace
-    prod/     ← production namespace (most restricted access)
-```
-
-A developer's Vault token scoped to the `dev/` namespace cannot read any path in `prod/`, even with an identical path structure. The PCI-DSS cardholder data environment (CDE) lives exclusively in `prod/`.
-
-**Sample policy differences by environment**:
-
-```hcl
-# dev namespace — payment-service policy
-# Dev credentials are synthetic/test values; broader access is acceptable for debugging
-path "secret/data/flexpay/*" {
-  capabilities = ["read", "list"]
-}
-
-# staging namespace — payment-service policy
-# Staging uses processor sandbox credentials; tighter scope than dev
-path "secret/data/flexpay/processors" {
-  capabilities = ["read"]
-}
-path "secret/data/flexpay/config" {
-  capabilities = ["read"]
-}
-
-# prod namespace — payment-service policy
-# Production: single path, read-only, no wildcards
-path "secret/data/flexpay/processors" {
-  capabilities = ["read"]
-}
-```
-
-### Pattern B — Separate Vault Instances per Environment (Open Source)
-
-For Vault OSS (no namespaces), the standard approach is to run one Vault cluster per environment. Each cluster is independently sealed, has its own root token (immediately revoked after setup), and is only accessible from the corresponding network segment. The `VAULT_ADDR` environment variable in the service configuration points to the correct cluster:
-
-| Environment | `VAULT_ADDR` | Network Access |
-|---|---|---|
-| dev | `http://vault-dev.internal:8200` | Developer VPN only |
-| staging | `https://vault-staging.internal:8200` | CI/CD runners + staging ECS/K8s |
-| prod | `https://vault-prod.internal:8200` | Production K8s nodes only (NetworkPolicy enforced) |
-
-AppRole SecretIDs are environment-scoped: a `VAULT_SECRET_ID` generated by the dev CI pipeline is invalid against the production Vault cluster because it was created under a different AppRole in a different cluster entirely.
-
-### Audit Log Segregation
-
-Each environment's Vault cluster ships its audit log to a dedicated log stream. In production, the audit log feeds into the SIEM (e.g., Splunk) under a dedicated PCI-DSS index with 1-year retention and tamper-evident storage — satisfying PCI-DSS Requirement 10.5 ("Secure audit trails so they cannot be altered"). Development and staging logs are retained for 30 days and are excluded from PCI-DSS scope.
+Each environment's audit log ships to a dedicated stream — prod logs feed the SIEM with 1-year retention per PCI-DSS Req 10.5; dev/staging logs are retained 30 days outside PCI scope.
