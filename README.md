@@ -192,8 +192,11 @@ curl -X POST http://localhost:3000/admin/refresh-secrets
 
 ```bash
 # View all secret access events (Vault audit backend)
-docker exec $(docker compose -f infrastructure/docker-compose.yml ps -q vault) \
+docker compose -f infrastructure/docker-compose.yml exec vault \
   cat /vault/logs/audit.log | jq .
+
+# Or view application-level audit events (service audit logger)
+curl -s http://localhost:3000/audit | jq .
 
 # Each entry shows: timestamp, operation, path, auth method
 # Secret VALUES are hashed in audit log (HMAC) — never in plaintext
@@ -327,6 +330,20 @@ Deploy Phase:         Triggers rolling update script
 | Req 12: Maintain information security policy | `DESIGN_DECISIONS.md` documents all trade-offs and rotation procedures |
 
 ## Troubleshooting
+
+**Mock credential values visible in vault-init logs**
+```bash
+# EXPECTED BEHAVIOR for PoC: Running `docker compose logs vault-init` will show
+# mock credential values in plaintext. This is intentional — the init script uses
+# `vault kv put` with inline mock values for PoC simplicity.
+#
+# In production: credentials would NEVER appear in CLI arguments or logs.
+# Instead, use Vault's "wrapped token" secure introduction pattern:
+#   1. Terraform Vault provider provisions secrets (state encrypted at rest)
+#   2. Vault Agent sidecar injects secrets via template rendering
+#   3. Init containers use wrapped tokens with single-use TTL
+# See DESIGN_DECISIONS.md Section 3 for full PoC vs Production comparison.
+```
 
 **Service shows unhealthy / 503**
 ```bash

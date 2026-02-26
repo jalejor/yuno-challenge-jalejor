@@ -60,7 +60,12 @@ enable_kv_secrets_engine() {
 
 seed_processor_credentials() {
   log "Writing payment processor credentials to Vault..."
-  log "NOTE: Seeding mock credentials for PoC. In production, real credentials are injected via secure introduction or CI secret injection at deployment time."
+  # PoC NOTE: These mock credential values will appear in vault-init container logs
+  # (visible via `docker compose logs vault-init`). This is acceptable for a PoC with
+  # mock data. In production, credentials would NEVER be passed as CLI arguments.
+  # Instead, use Vault's "wrapped token" secure introduction pattern or inject via
+  # Terraform Vault provider with state encryption. See DESIGN_DECISIONS.md Section 3.
+  log "NOTE: Seeding mock credentials for PoC. In production, real credentials are injected via secure introduction (wrapped tokens) — never as CLI arguments."
 
   # Write all 6 credentials for 3 processors in a single KV write
   # This ensures atomic updates — all credentials update together

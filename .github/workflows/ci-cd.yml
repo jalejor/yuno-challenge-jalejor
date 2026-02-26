@@ -230,6 +230,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: docker-image-${{ needs.build.outputs.short-sha }}
+          # Uses the short-sha output from the build job's 'meta' step
           # In production, images would be pushed to a container registry (ECR, GCR, etc.)
           # and pulled by tag — no artifact passing needed.
 
