@@ -1,0 +1,148 @@
+version: "3.8"
+
+# FlexPay Payment Gateway - Full Infrastructure Stack
+# PCI-DSS Compliant Secrets Management PoC
+#
+# Services:
+#   1. vault        - HashiCorp Vault secret store
+#   2. vault-init   - One-shot init container that seeds secrets & AppRole credentials
+#   3. payment-service - Node.js Express payment gateway (3 replicas)
+#
+# Security design:
+#   - NO payment credentials appear in this file
+#   - AppRole role_id / secret_id are injected via a shared volume (vault-credentials)
+#   - The payment service reads them from files, not environment variables
+#   - docker compose logs will never contain credential values
+
+networks:
+  backend:
+    driver: bridge
+
+volumes:
+  # Persistent Vault data (PoC: file storage; production: Consul / integrated storage)
+  vault-data:
+
+  # Shared volume: vault-init writes AppRole credentials here; payment-service reads them
+  vault-credentials:
+
+  # Vault audit logs (stretch goal: enable in config.hcl)
+  vault-logs:
+
+services:
+  # --------------------------------------------------------------------------
+  # Vault
+  # --------------------------------------------------------------------------
+  vault:
+    image: hashicorp/vault:latest
+    container_name: flexpay-vault
+    restart: unless-stopped
+    ports:
+      - "8200:8200"
+    environment:
+      # VAULT_DEV_ROOT_TOKEN_ID is only used in dev mode.
+      # Production: use proper unseal keys + KMS auto-unseal.
+      VAULT_DEV_ROOT_TOKEN_ID: "root"
+      VAULT_DEV_LISTEN_ADDRESS: "0.0.0.0:8200"
+      # Expose VAULT_ADDR so vault CLI commands inside the container resolve correctly
+      VAULT_ADDR: "http://127.0.0.1:8200"
+    cap_add:
+      # Required so Vault can lock memory pages and prevent secrets from being
+      # swapped to disk — a PCI-DSS relevant hardening measure.
+      - IPC_LOCK
+    volumes:
+      - vault-data:/vault/data
+      - vault-logs:/vault/logs
+      - ./vault/config.hcl:/vault/config/config.hcl:ro
+    command: server -dev
+    # NOTE: Using dev mode for PoC simplicity.
+    # Production deployment would use: vault server -config=/vault/config/config.hcl
+    # with a proper unseal process (KMS auto-unseal or manual unseal ceremony).
+    healthcheck:
+      test: ["CMD", "vault", "status"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      - backend
+
+  # --------------------------------------------------------------------------
+  # Vault Initializer (one-shot init container)
+  # --------------------------------------------------------------------------
+  # This service runs once after Vault is healthy:
+  #   1. Enables KV v2 secrets engine
+  #   2. Seeds the three processor credential sets
+  #   3. Enables AppRole auth method
+  #   4. Creates a least-privilege policy scoped to the processors path
+  #   5. Creates the payment-service AppRole and writes role_id / secret_id
+  #      to the shared vault-credentials volume
+  # After completion the container exits (restart: no).
+  vault-init:
+    image: hashicorp/vault:latest
+    container_name: flexpay-vault-init
+    restart: "no"
+    environment:
+      VAULT_ADDR: "http://vault:8200"
+      VAULT_TOKEN: "root"
+    volumes:
+      - ./vault/scripts/init-vault.sh:/init-vault.sh:ro
+      - ./vault/policies/payment-service.hcl:/payment-service.hcl:ro
+      - vault-credentials:/vault/credentials
+    command: sh /init-vault.sh
+    depends_on:
+      vault:
+        condition: service_healthy
+    networks:
+      - backend
+
+  # --------------------------------------------------------------------------
+  # Payment Service (3 replicas for zero-downtime rolling updates)
+  # --------------------------------------------------------------------------
+  # Key security properties:
+  #   - VAULT_ROLE_ID and VAULT_SECRET_ID are NOT in this file
+  #   - The service reads them from files mounted from vault-credentials volume
+  #   - Only the Vault address (non-secret) is an environment variable
+  #   - Health check gate: orchestrator won't route traffic until /health returns 200
+  payment-service:
+    image: flexpay-payment-service:latest
+    build:
+      context: ../service
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      PORT: "3000"
+      NODE_ENV: "production"
+      # Vault address is not a secret — it is the service discovery endpoint
+      VAULT_ADDR: "http://vault:8200"
+      # AppRole credentials are read from FILES, not env vars, to avoid
+      # exposure in `docker inspect`, process listings, or CI logs.
+      VAULT_ROLE_ID_FILE: "/vault/credentials/role_id"
+      VAULT_SECRET_ID_FILE: "/vault/credentials/secret_id"
+    volumes:
+      # Mount credentials volume read-only; service reads role_id and secret_id files
+      - vault-credentials:/vault/credentials:ro
+    ports:
+      - "3000-3002:3000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    depends_on:
+      vault-init:
+        condition: service_completed_successfully
+    # deploy block is honoured in Docker Swarm mode.
+    # For plain docker compose, use deploy.sh for rolling updates (see below).
+    deploy:
+      replicas: 3
+      update_config:
+        parallelism: 1        # Update one container at a time
+        delay: 10s            # Wait 10s between each update step
+        order: start-first    # Start new instance BEFORE stopping old one → zero-downtime
+        failure_action: rollback
+      rollback_config:
+        parallelism: 1
+        delay: 5s
+    networks:
+      - backend

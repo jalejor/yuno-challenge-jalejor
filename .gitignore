@@ -1,0 +1,54 @@
+# Dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment files - NEVER commit secrets
+.env
+.env.*
+!.env.example
+
+# Vault data and tokens - NEVER commit
+vault-data/
+tokens/
+vault-root-token
+*.token
+role_id
+secret_id
+approle-credentials/
+
+# Logs
+*.log
+logs/
+audit.log
+
+# Build artifacts
+dist/
+build/
+.tmp/
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V7
+.Trashes
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# Docker
+.docker/
+
+# Temporary files
+tmp/
+temp/

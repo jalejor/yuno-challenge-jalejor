@@ -1,0 +1,40 @@
+# Never include secrets or environment files in build context
+.env
+.env.*
+*.token
+role_id
+secret_id
+approle-credentials/
+
+# Dependencies - installed fresh in Docker
+node_modules/
+
+# Logs - no logs in image
+*.log
+logs/
+
+# Dev/test files
+*.test.js
+*.spec.js
+coverage/
+.nyc_output/
+
+# Documentation
+*.md
+README*
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Vault data
+vault-data/
+tokens/

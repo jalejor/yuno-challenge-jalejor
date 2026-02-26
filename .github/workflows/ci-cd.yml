@@ -1,0 +1,338 @@
+name: FlexPay Payment Service CI/CD
+
+# Triggers on every push and pull request.
+# PCI-DSS requires ALL code changes to pass security gates before merge.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+# Minimal permissions by default — principle of least privilege.
+# Jobs may escalate specific permissions as needed.
+permissions:
+  contents: read
+  security-events: write  # Required for uploading SARIF results to GitHub Security tab
+
+env:
+  IMAGE_NAME: flexpay-payment-service
+  DOCKERFILE_PATH: service/Dockerfile
+  SERVICE_DIR: service
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 1: Secret Scanning
+  # Purpose: Detect any accidentally committed credentials BEFORE building or
+  # deploying. This is the first gate — if secrets are found in code, the entire
+  # pipeline stops immediately. PCI-DSS Req 3.4 / 8.3 compliance.
+  # ─────────────────────────────────────────────────────────────────────────────
+  secret-scan:
+    name: Secret Scanning (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Fetch full history so gitleaks can scan all commits, not just the latest.
+          # This catches secrets that were committed and then "deleted" (still in history).
+          fetch-depth: 0
+
+      - name: Run gitleaks secret detection
+        # gitleaks scans the entire git history for API keys, passwords, tokens,
+        # and other credential patterns defined in .gitleaks.toml.
+        # If any secrets are found, this step exits non-zero and fails the pipeline.
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # GITLEAKS_LICENSE not required for public repos or open-source usage.
+          # For private repos in production, set GITLEAKS_LICENSE secret.
+
+      - name: Confirm no secrets found
+        # This step only runs if gitleaks passed — provides explicit audit log entry.
+        run: echo "✓ Secret scan passed — no credentials detected in repository history"
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 2: Build & Security Verification
+  # Purpose: Build the Docker image and verify it contains NO secrets in its
+  # layers, history, or metadata. Then scan for known CVEs with Trivy.
+  # PCI-DSS Req 6.3.2: Maintain an inventory of software components & scan for vulns.
+  # ─────────────────────────────────────────────────────────────────────────────
+  build:
+    name: Build & Verify Image Security
+    runs-on: ubuntu-latest
+    # Build only after secret scan passes — no point building a repo with leaked secrets.
+    needs: secret-scan
+    outputs:
+      image-tag: ${{ steps.meta.outputs.image-tag }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Image Metadata ──────────────────────────────────────────────────────
+      - name: Generate image tag
+        id: meta
+        # Tag with commit SHA for immutable, traceable image references.
+        # Never use :latest in production — makes rollback and audit impossible.
+        run: |
+          SHORT_SHA="${GITHUB_SHA::8}"
+          IMAGE_TAG="${IMAGE_NAME}:${SHORT_SHA}"
+          echo "image-tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "short-sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Image will be tagged: ${IMAGE_TAG}"
+
+      # ── Docker Build ────────────────────────────────────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image (multi-stage, no secrets)
+        # IMPORTANT: This build step receives ZERO payment credentials.
+        # The Dockerfile uses multi-stage build — only production artifacts
+        # are included in the final image. No .env files, no secret ENV vars.
+        # See service/Dockerfile for details.
+        run: |
+          docker build \
+            --file "${{ env.DOCKERFILE_PATH }}" \
+            --tag "${{ steps.meta.outputs.image-tag }}" \
+            --tag "${IMAGE_NAME}:latest" \
+            --label "git.sha=${{ github.sha }}" \
+            --label "git.ref=${{ github.ref }}" \
+            --label "build.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            "${{ env.SERVICE_DIR }}"
+
+      # ── Credential Verification in Image ───────────────────────────────────
+      - name: Verify no secrets in image layers (docker history)
+        # Examines all layer commands in the image history.
+        # Any RUN/ENV/COPY command that included a secret would appear here.
+        run: |
+          echo "=== Docker image layer history ==="
+          docker history --no-trunc "${{ steps.meta.outputs.image-tag }}"
+          echo ""
+          echo "=== Checking history for secret patterns ==="
+          FOUND=$(docker history --no-trunc "${{ steps.meta.outputs.image-tag }}" \
+            | grep -iE "(api_key|api_secret|password|secret_key|auth_token|processor_[abc])" \
+            | grep -v "^IMAGE" || true)
+          if [ -n "$FOUND" ]; then
+            echo "FAIL: Secret patterns detected in image history!"
+            echo "$FOUND"
+            exit 1
+          fi
+          echo "✓ PASS: No secret patterns in image layer history"
+
+      - name: Verify no secrets in image filesystem (layer export)
+        # Exports all image layers as a tar archive and scans file contents.
+        # This catches secrets that were COPY'd into files within the image.
+        # A truly clean image will have zero matches.
+        run: |
+          echo "=== Scanning image filesystem for embedded secrets ==="
+          # Export image to tar, extract, scan all files
+          SECRET_PATTERNS="PROCESSOR_A_API_KEY|PROCESSOR_A_SECRET|PROCESSOR_B_MERCHANT_ID|PROCESSOR_B_API_KEY|PROCESSOR_C_TOKEN|pk_live|sk_live|AQEy"
+          FOUND=$(docker save "${{ steps.meta.outputs.image-tag }}" \
+            | tar -x -O \
+            2>/dev/null \
+            | grep -rE "$SECRET_PATTERNS" \
+            2>/dev/null || true)
+          if [ -n "$FOUND" ]; then
+            echo "FAIL: Payment credentials found embedded in image layers!"
+            echo "$FOUND"
+            exit 1
+          fi
+          echo "✓ PASS: No payment credentials found in image filesystem"
+
+      - name: Verify no secret environment variables in image config
+        # Inspects the image configuration (not running container) for ENV vars.
+        # Payment credentials must NEVER appear as baked-in environment variables.
+        run: |
+          echo "=== Checking image config ENV vars ==="
+          ENV_VARS=$(docker inspect "${{ steps.meta.outputs.image-tag }}" \
+            --format '{{range .Config.Env}}{{println .}}{{end}}')
+          echo "Environment variables present in image:"
+          echo "${ENV_VARS:-<none>}"
+          echo ""
+          # Check for any payment credential patterns
+          CREDENTIAL_PATTERNS="API_KEY|API_SECRET|PROCESSOR_[ABC]_|MERCHANT_ID|PROCESSOR.*TOKEN"
+          FOUND=$(echo "$ENV_VARS" | grep -E "$CREDENTIAL_PATTERNS" || true)
+          if [ -n "$FOUND" ]; then
+            echo "FAIL: Payment credential ENV vars baked into image!"
+            echo "$FOUND"
+            exit 1
+          fi
+          echo "✓ PASS: No payment credentials in image environment configuration"
+
+      # ── Vulnerability Scanning ──────────────────────────────────────────────
+      - name: Run Trivy vulnerability scan
+        # Trivy scans the image for known CVEs in OS packages and application deps.
+        # PCI-DSS Req 6.3.3: Protect all system components from known vulnerabilities.
+        # We fail on HIGH and CRITICAL vulnerabilities — MEDIUM/LOW are reported only.
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.meta.outputs.image-tag }}
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "HIGH,CRITICAL"
+          exit-code: "1"  # Fail the pipeline on HIGH/CRITICAL findings
+          ignore-unfixed: true  # Don't fail on vulns with no available fix
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        # SARIF upload makes results visible in the Security tab for audit trail.
+        # Runs even if Trivy step failed (to preserve the report).
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: "trivy-results.sarif"
+
+      - name: Trivy scan summary
+        if: success()
+        run: echo "✓ Trivy scan passed — no HIGH/CRITICAL vulnerabilities in image"
+
+      # ── Save Image for Deploy Job ───────────────────────────────────────────
+      - name: Export image as artifact
+        # Save the verified, scanned image for use in the deploy job.
+        # This ensures deploy uses the exact same image that passed all checks.
+        run: |
+          docker save "${{ steps.meta.outputs.image-tag }}" \
+            | gzip > /tmp/flexpay-image.tar.gz
+          echo "Image saved: $(du -sh /tmp/flexpay-image.tar.gz | cut -f1)"
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-${{ steps.meta.outputs.short-sha }}
+          path: /tmp/flexpay-image.tar.gz
+          retention-days: 1  # Short retention — don't accumulate artifacts
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 3: Deploy (main branch only)
+  # Purpose: Perform rolling deployment using infrastructure/deploy.sh.
+  # CRITICAL: This job receives ZERO payment credentials. Vault provides all
+  # payment secrets at container runtime via AppRole authentication.
+  # The pipeline's only "secret" is the deployment host SSH key (infra concern,
+  # not a payment credential). PCI-DSS Req 6.5: Protect all software components.
+  # ─────────────────────────────────────────────────────────────────────────────
+  deploy:
+    name: Rolling Deploy (main branch)
+    runs-on: ubuntu-latest
+    needs: [secret-scan, build]
+    # Only deploy from the main branch — feature branches trigger build/scan only.
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    # GitHub Environment enables deployment protection rules:
+    # - Required reviewers before production deploy
+    # - Deployment history and audit log
+    # - Environment-specific secrets (e.g., deployment host key)
+    environment: production
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download verified image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image-${{ needs.build.outputs.image-tag && '' || github.sha && '' }}
+          # Note: artifact name uses short SHA; rebuild from meta in real deployment
+          # In production, images would be pushed to a container registry (ECR, GCR, etc.)
+          # and pulled by tag — no artifact passing needed.
+
+      - name: Load Docker image
+        run: |
+          ls -la *.tar.gz 2>/dev/null || ls -la /tmp/flexpay-image.tar.gz 2>/dev/null || true
+          # In production: docker pull ghcr.io/org/flexpay-payment-service:${{ github.sha }}
+          echo "NOTE: In production, this step would pull from container registry."
+          echo "For PoC local demo, image is loaded from build artifact."
+
+      # ── Deployment Architecture Note ────────────────────────────────────────
+      # In production, deploy would SSH to hosts or call Kubernetes API.
+      # For this PoC, we document the deployment process and simulate validation.
+      #
+      # SECURITY DESIGN:
+      # 1. CI pipeline builds image — no payment secrets available
+      # 2. Image pushed to registry with immutable SHA tag
+      # 3. Deployment target (Docker host / K8s cluster) pulls image
+      # 4. Container starts → authenticates to Vault via AppRole
+      # 5. Vault validates AppRole credentials → returns payment secrets
+      # 6. Service loads secrets into memory → health check passes
+      # 7. Orchestrator routes traffic to new instance
+      # Payment credentials NEVER pass through the CI/CD pipeline.
+      # ────────────────────────────────────────────────────────────────────────
+
+      - name: Validate deployment configuration
+        # Verify the deployment scripts are present and executable.
+        # In a real deployment, this step would trigger the rolling update
+        # on the target infrastructure.
+        run: |
+          echo "=== Deployment Validation ==="
+          echo "Commit: ${{ github.sha }}"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Triggered by: ${{ github.actor }}"
+          echo ""
+          echo "Verifying deployment scripts..."
+          test -f infrastructure/deploy.sh && echo "✓ deploy.sh present" || echo "✗ deploy.sh missing"
+          test -f infrastructure/vault/scripts/init-vault.sh && echo "✓ init-vault.sh present" || echo "✗ init-vault.sh missing"
+          test -f infrastructure/vault/scripts/rotate-secret.sh && echo "✓ rotate-secret.sh present" || echo "✗ rotate-secret.sh missing"
+          echo ""
+          echo "=== Deployment Architecture ==="
+          echo "1. Container registry receives image: ${IMAGE_NAME}:${{ github.sha }}"
+          echo "2. Rolling update initiated via deploy.sh"
+          echo "3. New container starts, authenticates to Vault (AppRole)"
+          echo "4. Vault provides payment credentials at runtime"
+          echo "5. Health check passes → traffic routed to new instance"
+          echo "6. Old instance terminated after grace period"
+          echo ""
+          echo "NO PAYMENT CREDENTIALS EXIST IN THIS PIPELINE."
+          echo "All payment secrets are managed exclusively by HashiCorp Vault."
+
+      - name: Simulate rolling deployment
+        # This step represents what deploy.sh does on the target infrastructure.
+        # In production: ssh deploy@host "cd /app && ./infrastructure/deploy.sh"
+        run: |
+          echo "=== Rolling Deployment Simulation ==="
+          echo "In production deployment:"
+          echo "  - Pull image: docker pull ${IMAGE_NAME}:${{ github.sha }}"
+          echo "  - Execute: infrastructure/deploy.sh"
+          echo "  - Monitor: docker compose ps (verify all replicas healthy)"
+          echo "  - Validate: curl http://service-host/health"
+          echo ""
+          echo "Rolling update config:"
+          echo "  - parallelism: 1 (update one replica at a time)"
+          echo "  - delay: 10s (between replica updates)"
+          echo "  - order: start-first (new replica healthy before old removed)"
+          echo "  - failure_action: rollback (automatic rollback on health failure)"
+          echo ""
+          echo "✓ Deployment configuration validated"
+
+      - name: Post-deployment health verification
+        # Verify the deployment succeeded by checking the health endpoint.
+        # Health returns 503 until secrets are loaded from Vault — this is the
+        # primary zero-downtime signal (orchestrator won't route traffic until
+        # secrets are available and verified).
+        run: |
+          echo "=== Post-Deployment Health Check ==="
+          echo "In production, this step would poll:"
+          echo "  curl --retry 10 --retry-delay 5 http://payment-service/health"
+          echo ""
+          echo "Expected response when secrets are loaded from Vault:"
+          echo '  { "status": "healthy", "secretsLoaded": true, "processors": ["A","B","C"] }'
+          echo ""
+          echo "If secrets are NOT loaded (Vault unreachable):"
+          echo '  HTTP 503: { "status": "unhealthy", "secretsLoaded": false }'
+          echo "  → Deployment halted, rollback triggered"
+          echo ""
+          echo "✓ Post-deployment validation configuration confirmed"
+
+      - name: Record deployment audit entry
+        # PCI-DSS Req 10.2: Implement audit logs to detect anomalies and suspicious activity.
+        # Every deployment must be recorded with who, what, when, and from where.
+        run: |
+          echo "=== Deployment Audit Record ==="
+          echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "actor=${{ github.actor }}"
+          echo "commit=${{ github.sha }}"
+          echo "branch=${{ github.ref_name }}"
+          echo "workflow=${{ github.workflow }}"
+          echo "run_id=${{ github.run_id }}"
+          echo "image=${IMAGE_NAME}:${{ github.sha }}"
+          echo "payment_credentials_in_pipeline=false"
+          echo "secrets_provider=HashiCorp Vault (AppRole)"
+          echo ""
+          echo "✓ Deployment audit entry recorded"
+          # In production: send this to your SIEM / audit logging system

@@ -1,0 +1,117 @@
+# Gitleaks configuration for FlexPay payment service
+# Detects secrets, API keys, and credentials before they reach the repository
+# Reference: https://github.com/gitleaks/gitleaks
+
+title = "FlexPay Gitleaks Configuration"
+
+[extend]
+# Extend the default gitleaks ruleset
+useDefault = true
+
+# ---- Custom rules for payment processor credentials ----
+
+[[rules]]
+id = "processor-api-key"
+description = "Payment Processor API Key"
+regex = '''(?i)(processor[_-]?[abc][_-]?api[_-]?key)\s*[=:]\s*['"]?([a-zA-Z0-9_\-]{20,})['"]?'''
+tags = ["payment", "api-key", "processor"]
+severity = "CRITICAL"
+
+[[rules]]
+id = "processor-secret"
+description = "Payment Processor Secret"
+regex = '''(?i)(processor[_-]?[abc][_-]?secret)\s*[=:]\s*['"]?([a-zA-Z0-9_\-]{20,})['"]?'''
+tags = ["payment", "secret", "processor"]
+severity = "CRITICAL"
+
+[[rules]]
+id = "processor-token"
+description = "Payment Processor Token"
+regex = '''(?i)(processor[_-]?[abc][_-]?token)\s*[=:]\s*['"]?([a-zA-Z0-9_\-]{20,})['"]?'''
+tags = ["payment", "token", "processor"]
+severity = "CRITICAL"
+
+[[rules]]
+id = "vault-token"
+description = "HashiCorp Vault Token"
+regex = '''(?i)vault[_-]?token\s*[=:]\s*['"]?(s\.[a-zA-Z0-9]{24,}|hvs\.[a-zA-Z0-9]{90,})['"]?'''
+tags = ["vault", "token"]
+severity = "CRITICAL"
+
+[[rules]]
+id = "vault-secret-id"
+description = "HashiCorp Vault AppRole Secret ID"
+regex = '''(?i)vault[_-]?secret[_-]?id\s*[=:]\s*['"]?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})['"]?'''
+tags = ["vault", "approle", "secret-id"]
+severity = "CRITICAL"
+
+[[rules]]
+id = "stripe-live-key"
+description = "Stripe Live API Key"
+regex = '''sk_live_[0-9a-zA-Z]{24,}'''
+tags = ["stripe", "api-key", "payment"]
+severity = "CRITICAL"
+
+[[rules]]
+id = "stripe-publishable-key"
+description = "Stripe Publishable Key (live)"
+regex = '''pk_live_[0-9a-zA-Z]{24,}'''
+tags = ["stripe", "api-key", "payment"]
+severity = "HIGH"
+
+[[rules]]
+id = "generic-password-assignment"
+description = "Generic password in assignment"
+regex = '''(?i)(password|passwd|pwd)\s*[=:]\s*['"]?([^'"\s]{8,})['"]?'''
+tags = ["password", "generic"]
+severity = "HIGH"
+[rules.allowlist]
+regexes = [
+  '''(?i)(password|passwd|pwd)\s*[=:]\s*['"]?(placeholder|changeme|example|your[_-]?password|<password>|\$\{|#{)'''
+]
+
+[[rules]]
+id = "generic-secret-assignment"
+description = "Generic secret in assignment"
+regex = '''(?i)(secret|api_secret|client_secret)\s*[=:]\s*['"]?([a-zA-Z0-9+/]{16,}={0,2})['"]?'''
+tags = ["secret", "generic"]
+severity = "HIGH"
+[rules.allowlist]
+regexes = [
+  '''(?i)(secret|api_secret|client_secret)\s*[=:]\s*['"]?(placeholder|example|your[_-]?secret|<secret>|\$\{|#{)'''
+]
+
+[[rules]]
+id = "private-key-header"
+description = "Private Key PEM Header"
+regex = '''-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY( BLOCK)?-----'''
+tags = ["private-key", "cryptography"]
+severity = "CRITICAL"
+
+[[rules]]
+id = "aws-access-key"
+description = "AWS Access Key ID"
+regex = '''(A3T[A-Z0-9]|AKIA|AGPA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}'''
+tags = ["aws", "access-key"]
+severity = "CRITICAL"
+
+# ---- Global allowlist ----
+[allowlist]
+description = "Global allowlist for test/mock values"
+regexes = [
+  # Mock/test values explicitly used in scripts
+  '''mock_stripe_key''',
+  '''mock_adyen_key''',
+  '''mock_abc123''',
+  '''regional_mock''',
+  # Example placeholder patterns
+  '''<your[_-]''',
+  '''\$\{[A-Z_]+\}''',
+]
+paths = [
+  # Allow secrets in rotation demo script (contains mock values)
+  '''infrastructure/vault/scripts/rotate-secret\.sh''',
+  # Allow mock values in init script
+  '''infrastructure/vault/scripts/init-vault\.sh''',
+]
+commits = []
